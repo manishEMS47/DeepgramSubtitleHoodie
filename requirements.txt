@@ -1,0 +1,4 @@
+pyaudio
+pygame
+deepgram-sdk<2        # legacy v0.x SDK: `from deepgram import Deepgram`
+websockets           # 60db TTS WebSocket client

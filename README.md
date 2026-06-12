@@ -44,13 +44,25 @@ I built this stupid project for a [YouTube video sponsored by Deepgram](https://
 
 * Connect the Pi to Wi-Fi, unless you like wiring yourself to the wall via Ethernet
 * Update Pygame: `pip install pygame --upgrade`
-* ~~~Own~~~ Install the libs: `pip install pyaudio deepgram` 
+* ~~~Own~~~ Install the libs: `pip install -r requirements.txt` (pyaudio, deepgram-sdk, websockets)
 * Make folders: `mkdir /home/pi/hoodie/res`
 * Download everything in the repo except the models and move 'em to /home/pi/hoodie
 * `cd /home/pi/hoodie; chmod +x main.py install-service.py`
 * Download the font VCR_OSD_MONO-1.001.ttf and move it to /home/pi/hoodie/res. Don't you dare rename it. It's beautiful just the way it is.
 * `sudo ./install-service.py`
-* Edit main.py to replace PUT YOUR API KEY HERE YOU JABRONI with your Deepgram API key
+* Set your API keys as environment variables (no more editing main.py):
+  * `DEEPGRAM_API_KEY` — your Deepgram key (live subtitles / STT)
+  * `SIXTYDB_API_KEY` — your 60db key (spoken voice / TTS), format `sk_live_*`
+  * `SIXTYDB_VOICE_ID` — optional; the 60db voice to speak in. List yours with `python -m providers.sixtydb_tts`. Defaults to 60db's stock voice if unset.
+  * For the systemd service, add these to `teletubby.service` as `Environment="DEEPGRAM_API_KEY=..."` lines (or an `EnvironmentFile=`).
 * Hopefully it works. I dunno, I was pretty sleep-deprived when I built this...
+
+## How 60db (TTS) is wired in
+
+Deepgram still does the live subtitles. On top of that, every **finalized** line is queued to **60db** over its TTS WebSocket (`ws://api.60db.ai/ws/tts`), which streams back LINEAR16 PCM that gets played out the Codec Zero. So the hoodie now *shows* and *says* what you said.
+
+Both vendors sit behind small interfaces in `providers/` (`STTProvider`/`TTSProvider`), so swapping or adding a provider is a one-line change in `main.py` and the display/audio code never touches a vendor's response shape.
+
+To avoid the mic hearing the hoodie's own TTS and transcribing it into an infinite echo loop, mic audio is **gated** (not sent to Deepgram) while TTS is playing, plus a short tail. This is safe on headphones and essential on a speaker.
 
 Licensed Creative Commons 4.0 Attribution. Feel free to try and use this to make money.

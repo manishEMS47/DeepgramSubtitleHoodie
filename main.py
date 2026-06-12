@@ -8,22 +8,23 @@ from string import punctuation
 
 import pyaudio
 import pygame
-from deepgram import Deepgram
-from deepgram.transcription import LiveTranscription
+
+from providers import DeepgramSTT, SixtyDBTTS, TranscriptResult
+from providers.sixtydb_tts import DEFAULT_VOICE_ID
 
 
 # Data structure to help associate words with their timestamps.
-# We display Deepgram's transcription, but we need to track the individual words to make old lines scroll away.
+# We display the transcription, but we need to track the individual words to make old lines scroll away.
 # Note that the words' text DOES NOT necessarily match the transcription - that has capitalization, punctuation, etc.
 class TranscriptionWord:
     equality_tolerance = 0.01  # If two offset times are within this many seconds, they're equal enough for me
 
     def __init__(self, text, start, end, time_offset=0, request_id=0):
         self.text = text
-        self.start = start  # Note that Deepgram's API returns times in seconds since the beginning of the snippet.
+        self.start = start  # Note that the STT API returns times in seconds since the beginning of the snippet.
         self.end = end
         self.time_offset = time_offset  # We're stringing multiple snippets into one, so we need a global time offset.
-        self.request_id = request_id  # Used to confirm that Deepgram's API doesn't juggle multiple interim transcripts
+        self.request_id = request_id  # Used to confirm that the API doesn't juggle multiple interim transcripts
         # It would be an absolute nightmare to code for that, so I want to make sure it's a real possibility.
 
     # Number of seconds between the time this whole set of transcripts began, and the time this word began
@@ -35,7 +36,7 @@ class TranscriptionWord:
         return self.end + self.time_offset
 
     # Convenience method to apply tolerance in comparing timestamps.
-    # Deepgram's temporal subdivision in interim transcripts is quite jittery - all word bounds shift every time.
+    # Temporal subdivision in interim transcripts is quite jittery - all word bounds shift every time.
     def _roughly_equals(self, a, b):
         return abs(a - b) <= self.equality_tolerance
 
@@ -67,10 +68,13 @@ class SubtitleDisplay:
     interim_words: list[TranscriptionWord]
     currently_displayed_words: list[list[TranscriptionWord]]
 
-    def __init__(self, display, font):
+    def __init__(self, display, font, on_final_transcript=None):
         self.display = display
         self.font = font
         self.font_height = self.font.size("Tg")[1]
+
+        # Fired with each finalized line of text. The hoodie hooks this up to speak it aloud via TTS.
+        self.on_final_transcript = on_final_transcript
 
         self.done = False
 
@@ -80,7 +84,7 @@ class SubtitleDisplay:
         it won't fit on the shirt. We need to display each line for a bit, then move on.
         The problem is that we need to use interim mode for responsiveness, so parts of the transcript will change.
         By carefully tracking the individual words as well as the transcripts, we can use timestamps to
-        figure out which SOUNDS have been shown to the viewer, so we don't end up showing the same WORDS repeatedly.  
+        figure out which SOUNDS have been shown to the viewer, so we don't end up showing the same WORDS repeatedly.
         '''
         self.minimum_line_display_time = 0.75  # Minimum number of seconds that each word should display on the top line
         self.timebase = None  # Datetime when first word of this caption set was displayed
@@ -120,7 +124,7 @@ class SubtitleDisplay:
         # I should probably wait for them to shut down or something
         self.done = True
 
-    # The business end! Pull a Deepgram response from the queue and turn it into chest letters.
+    # The business end! Pull an STT result from the queue and turn it into chest letters.
     async def handle_transcript(self, transcript, response_words, request_id, is_final):
         # Lock out the expiration timer loop - we don't want to delete lines as we're editing them
         async with self.transcript_lock:
@@ -147,7 +151,7 @@ class SubtitleDisplay:
             '''
             Final transcripts don't change. By tracking them separately, we don't need to compare every incoming word
             to every received word and constantly update every transcript. We just clobber the interim stuff with
-            the new and ignore the final stuff. 
+            the new and ignore the final stuff.
             There should only be a single interim request going at a time, but Murphy's got my number.
             '''
             if is_final:
@@ -160,6 +164,11 @@ class SubtitleDisplay:
                 del self.interim_words[:]
                 self.interim_transcript = ''
                 self.current_request_id = -1
+
+                # Speak this freshly finalized line out loud (TTS). Only finalized lines - never the
+                # jittery interim ones - so nothing gets spoken twice or mid-revision.
+                if self.on_final_transcript is not None and transcript.strip():
+                    self.on_final_transcript(transcript)
             else:
                 # Just overwrite the old interim stuff with the new.
                 # Changes come into play when we RENDER - remember that we still have currently_displayed_words
@@ -167,10 +176,10 @@ class SubtitleDisplay:
                 self.interim_words = words
 
             '''
-            Writing support for multiple concurrent interim transcripts would be a nightmare, but Deepgram's docs 
+            Writing support for multiple concurrent interim transcripts would be a nightmare, but the docs
             assure me that they only maintain one interim transcript at a time.
-            But I have trust issues, and wacky TCP shenanigans are also in play. 
-            Instead of solving a bug that I'm not sure exists, I want my code to bring its presence to my attention. 
+            But I have trust issues, and wacky TCP shenanigans are also in play.
+            Instead of solving a bug that I'm not sure exists, I want my code to bring its presence to my attention.
             By crashing.
             Premature optimization is the root of all evil! Don't solve problems until they exist!
             '''
@@ -180,33 +189,22 @@ class SubtitleDisplay:
             # All that crap for this.
             await self.render()
 
-    # At our leisure, we pull Deepgram API responses from their queue and chooch 'em up.
+    # At our leisure, we pull normalized STT results from their queue and chooch 'em up.
     # This should always INCREASE the amount of stuff to display, never remove stuff.
     async def transcription_interpreter_loop(self):
         while not self.done:
-            response = await self.unprocessed_transcription_queue.get()
-
-            try:
-                # I should probably move this back to the bit of the code that inserts it into the queue.
-                # Gotta consolidate all the Deepgram SDK funsies in case the spec changes.
-                transcript = response['channel']['alternatives'][0]['transcript']
-                words = response['channel']['alternatives'][0]['words']
-                request_id = response['metadata']['request_id']
-                is_final = response['is_final']
-
-                await self.handle_transcript(transcript, words, request_id, is_final)
-            except KeyError:
-                # Status messages, metadata, confirmation, and who knows what else
-                print('Not a transcription')
+            result: TranscriptResult = await self.unprocessed_transcription_queue.get()
+            # The provider already normalized and validated the vendor's response shape for us.
+            await self.handle_transcript(result.transcript, result.words, result.request_id, result.is_final)
 
         print('Transcription interpreter loop is dead')
 
     '''
-    It doesn't matter how fast I talk - the subtitles are meaningless unless the viewer has time to read 'em. 
-    When every word on the top line has been displayed for a sec or so, we want to scroll the whole 
-    thing up to show more transcript. Remember that I'm an obnoxious bastard AND the display is small - I can 
-    overflow the whole screen with just PART of a sentence. 
-    Even if I'm still talkin, we need to keep those captions rolling. 
+    It doesn't matter how fast I talk - the subtitles are meaningless unless the viewer has time to read 'em.
+    When every word on the top line has been displayed for a sec or so, we want to scroll the whole
+    thing up to show more transcript. Remember that I'm an obnoxious bastard AND the display is small - I can
+    overflow the whole screen with just PART of a sentence.
+    Even if I'm still talkin, we need to keep those captions rolling.
     '''
     async def expiration_timing_loop(self):
         while not self.done:
@@ -268,7 +266,7 @@ class SubtitleDisplay:
         combined_transcript = combined_transcript.strip().replace('  ', ' ')
 
         if len(combined_transcript):  # Remember that we also call render() to clear the screen when we're all done.
-            # Deepgram transcripts aren't always capitalized... but they shoooooould...
+            # Transcripts aren't always capitalized... but they shoooooould...
             combined_transcript = combined_transcript[0].upper() + combined_transcript[1:]
 
             # The TranscriptionWords got the timestamps, but we're displaying the formatted transcript.
@@ -398,29 +396,69 @@ class SubtitleHoodie:
     subtitle_display: SubtitleDisplay
 
     def __init__(self):
-        # Your Deepgram API Key
-        self.DEEPGRAM_API_KEY = 'PUT YOUR API KEY HERE YOU JABRONI'
+        # API keys come from the environment now - no more hardcoded jabroni placeholder.
+        self.DEEPGRAM_API_KEY = os.environ.get('DEEPGRAM_API_KEY', '')
+        self.SIXTYDB_API_KEY = os.environ.get('SIXTYDB_API_KEY', '')
+        # Which 60db voice to speak in. List yours with: python -m providers.sixtydb_tts
+        self.VOICE_ID = os.environ.get('SIXTYDB_VOICE_ID', DEFAULT_VOICE_ID)
+
         self.FRAMES_PER_BUFFER = 8192  # We need to read audio samples seriously fast, or its tiny buffer overflows
-        self.SAMPLE_RATE = 44100  # I want more samples for faster peak detection
+        self.SAMPLE_RATE = 44100  # I want more samples for faster peak detection (mic capture / Deepgram)
+        self.TTS_SAMPLE_RATE = 24000  # 60db LINEAR16 output rate - drives the playback device
 
         # TODO: Noise floor is too crude to detect start-of-message, pick something sensitive
-        self.NOISE_FLOOR = 125  # Quietest block that could be speech - don't send anything quieter to Deepgram
+        self.NOISE_FLOOR = 125  # Quietest block that could be speech - don't send anything quieter to STT
         self.QUIET_DEADLINE = 2  # If I'm quiet for this many seconds (using noise floor), stop forwarding audio
+
+        # Half-duplex echo gating: while the hoodie is speaking through the Codec Zero, the lavalier
+        # mic would hear its own TTS, re-transcribe it, and speak it again forever. So we refuse to feed
+        # mic audio to STT until shortly after playback drains. (Headphones don't need this, but it's
+        # harmless with them, and essential with a speaker.)
+        self.TTS_GATE_TAIL = 0.4  # Keep muting the mic for this many extra seconds after audio drains
+        self.tts_playback_until = datetime.datetime.min  # Wall-clock time the queued TTS audio finishes
 
         # TODO: Anything with this
         self.done = False
+
+        # These asyncio objects get created once the event loop is running (in do_the_thing).
+        self.tts_speak_queue = None     # Finalized transcript lines waiting to be synthesized
+        self.tts_output_queue = None    # Decoded PCM chunks waiting to be played out the speaker
 
         # Download retro flavor at https://www.dafont.com/vcr-osd-mono.font
         # The font's licensing is unclear, so I'm not including it here.
         project_root = os.path.dirname(os.path.abspath(__file__))
         subtitle_font = pygame.font.Font(os.path.join(project_root, 'res/VCR_OSD_MONO_1.001.ttf'), 125)
         lcd = pygame.display.set_mode((480, 1280), pygame.FULLSCREEN)
-        self.subtitle_display = SubtitleDisplay(lcd, subtitle_font)
+        # Wire the display's "this line is final" event to our TTS queue.
+        self.subtitle_display = SubtitleDisplay(lcd, subtitle_font, on_final_transcript=self.enqueue_for_speech)
 
-    # Simple callback that dumps the response straight in the transcription queue.
+    # Simple callback that dumps the normalized STT result straight in the transcription queue.
     # A loop will collect and handle it automatically.
-    def handle_response(self, response):
-        self.subtitle_display.unprocessed_transcription_queue.put_nowait(response)
+    def handle_response(self, result: TranscriptResult):
+        self.subtitle_display.unprocessed_transcription_queue.put_nowait(result)
+
+    # Called by the display when a line is finalized. Queue it up to be spoken aloud.
+    def enqueue_for_speech(self, text):
+        if self.tts_speak_queue is not None and text.strip():
+            self.tts_speak_queue.put_nowait(text.strip())
+
+    # Called by the 60db TTS provider for every chunk of synthesized PCM audio.
+    def handle_tts_audio(self, pcm: bytes):
+        if self.tts_output_queue is None:
+            return
+        self.tts_output_queue.put_nowait(pcm)
+
+        # Extend the echo-gate window by however long this chunk takes to play.
+        # 2 bytes per sample, mono. Chunks stack up, so anchor off the later of (now, current deadline).
+        chunk_seconds = len(pcm) / (self.TTS_SAMPLE_RATE * 2)
+        now = datetime.datetime.now()
+        anchor = max(now, self.tts_playback_until)
+        self.tts_playback_until = anchor + datetime.timedelta(seconds=chunk_seconds)
+
+    def is_speaking(self):
+        # True while TTS audio is playing (plus a short tail) - mic is gated during this window.
+        deadline = self.tts_playback_until + datetime.timedelta(seconds=self.TTS_GATE_TAIL)
+        return datetime.datetime.now() < deadline
 
     # Read audio. This absolutely must run as often as possible.
     async def get_a_chunk(self, stream, queue):
@@ -438,6 +476,26 @@ class SubtitleHoodie:
 
         while not self.done:
             await self.get_a_chunk(stream, queue)
+
+    # Pull finalized lines off the queue and have 60db speak them, one at a time, in order.
+    async def tts_speak_loop(self, tts):
+        while not self.done:
+            text = await self.tts_speak_queue.get()
+            try:
+                await tts.speak(text)
+            except Exception as e:
+                print(f'TTS speak failed: {e}')
+
+    # Pull decoded PCM off the queue and write it to the output device (Codec Zero -> speaker/headphones).
+    # stream.write blocks, so we hand it to a thread to keep the event loop responsive.
+    async def tts_playback_loop(self, out_stream):
+        loop = asyncio.get_event_loop()
+        while not self.done:
+            pcm = await self.tts_output_queue.get()
+            try:
+                await loop.run_in_executor(None, out_stream.write, pcm)
+            except Exception as e:
+                print(f'TTS playback failed: {e}')
 
     # God method so overburdened and all-encompassing it can cause functional programmers to projectile-diarrhea
     async def do_the_thing(self):
@@ -468,78 +526,76 @@ class SubtitleHoodie:
                    input=True, output=False,
                    frames_per_buffer=self.FRAMES_PER_BUFFER, )
 
+        # Output stream for TTS playback (Codec Zero -> speaker/headphones). 16-bit mono at 60db's rate.
+        out_stream = p.open(format=pyaudio.paInt16, rate=self.TTS_SAMPLE_RATE, channels=1,
+                            input=False, output=True)
+
         q: asyncio.Queue[tuple[datetime.datetime, bytearray]] = asyncio.Queue()
+        self.tts_speak_queue = asyncio.Queue()
+        self.tts_output_queue = asyncio.Queue()
 
         asyncio.create_task(self.audio_receiver(s, q))
 
         # IT'S HAPPENING
         self.subtitle_display.start_the_loops_brother()
 
-        # OH MY GOD IT'S HAPPENING
-        deepgram = Deepgram(self.DEEPGRAM_API_KEY)
+        # OH MY GOD IT'S HAPPENING - bring up the providers behind their interfaces.
+        stt = DeepgramSTT(self.DEEPGRAM_API_KEY, self.SAMPLE_RATE, on_transcript=self.handle_response)
+        tts = SixtyDBTTS(self.SIXTYDB_API_KEY, self.VOICE_ID,
+                         sample_rate=self.TTS_SAMPLE_RATE, on_audio=self.handle_tts_audio)
 
-        deepgram_live: LiveTranscription = await self.create_live_transcription_websocket(deepgram)
-        print('Created initial live websocket')
+        await stt.connect()
+        print('Created initial live STT websocket')
+
+        await tts.connect()
+        print('Created 60db TTS websocket')
+
+        # Spin up the TTS pipeline loops now that the queues and providers exist.
+        asyncio.create_task(self.tts_speak_loop(tts))
+        asyncio.create_task(self.tts_playback_loop(out_stream))
 
         # If we kill the socket without sending anything, weird things happen.
         # But, we need to go in with a socket or we'll need to check 'is None' in a million places.
         # So here's the worst kind of workaround - one that costs money.
         print('sending bogus data')
-        deepgram_live.send(bytearray([0] * self.FRAMES_PER_BUFFER))
+        await stt.send_audio(bytearray([0] * self.FRAMES_PER_BUFFER))
         print('sent')
 
         # I'M GONNA... I'M GONNA... SUUUUUUBTITLE
         while not self.done:
             timestamp, incoming = await asyncio.wait_for(q.get(), None)
 
+            # While the hoodie is talking to itself, don't feed the mic to STT - that's just our own
+            # TTS bleeding into the mic, and transcribing it would cause an infinite echo loop.
+            if self.is_speaking():
+                continue
+
             rms = audioop.rms(incoming, 2)  # The 2 is the number of bytes in one sample of our 16-bit int wav
 
             if rms >= self.NOISE_FLOOR:
                 last_loud_enough_timestamp = timestamp
-                if deepgram_live.done:  # We can't reuse an instance - we need to create another one
-                    print('We got some action! Creating a fresh live transcription websocket')
-                    deepgram_live = await self.create_live_transcription_websocket(deepgram)
+                if stt.done:  # We can't reuse an instance - we need to create another one
+                    print('We got some action! Creating a fresh live STT websocket')
+                    await stt.connect()
                     print('Created')
 
             # Kill the connection after a few seconds of silence to conserve API credit
             if has_been_quiet_for_too_long(last_loud_enough_timestamp):
-                if not deepgram_live.done:
-                    print('Quiet for too long. Killing live transcription websocket')
-                    await deepgram_live.finish()
+                if not stt.done:
+                    print('Quiet for too long. Killing live STT websocket')
+                    await stt.finish()
                     print('Done')
             else:
-                deepgram_live.send(incoming)
+                await stt.send_audio(incoming)
 
         s.stop_stream()  # Cleanly exit
         s.close()
+        out_stream.stop_stream()
+        out_stream.close()
 
-        # Indicate that we've finished sending data by sending a zero-byte message to the Deepgram streaming endpoint,
-        # and wait until we get back the final summary metadata object
-        await deepgram_live.finish()
-
-    # We can't reuse an instance of the Deepgram SDK websocket thingy - if we hang up, we need to generate a fresh one.
-    # Note that this has absolutely no relationship to Request IDs - those are split by pauses between statements.
-    async def create_live_transcription_websocket(self, deepgram):
-        # Create a websocket connection to Deepgram
-        # In this example, punctuation is turned on, interim results are turned off, and language is set to UK English.
-        try:
-            deepgram_live = await deepgram.transcription.live(
-                {
-                    'language': 'en-US',  # Change to en-UK or something if you're one of THOSE people
-                    'encoding': 'linear16', 'sample_rate': self.SAMPLE_RATE,  # Corresponds to PyAudio config
-                    'punctuate': True,          # I'm such a chad my speech has punctuation
-                    'interim_results': False,    # Return ANYTHING as soon as possible, for responsiveness
-                    'diarize': True,            # TODO: Distinguish yours truly from whoever I'm talking to
-                })
-        except Exception as e:
-            print(f'Could not open socket: {e}')
-            raise
-
-        # Listen for the connection to close
-        deepgram_live.registerHandler(deepgram_live.event.CLOSE, lambda c: print(f'Connection closed with code {c}.'))
-        # Listen for any transcripts received from Deepgram and write them to the console
-        deepgram_live.registerHandler(deepgram_live.event.TRANSCRIPT_RECEIVED, lambda c: self.handle_response(c))
-        return deepgram_live
+        # Indicate that we've finished sending data and wait for final results, then close TTS.
+        await stt.finish()
+        await tts.close()
 
 
 # Run the whole module as a script, see if I care
